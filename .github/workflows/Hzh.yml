@@ -1,0 +1,70 @@
+
+name: SpotiFLAC Compatibility Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git
+
+      - name: Clone SpotiFLAC
+        run: |
+          git clone --depth 1 \
+            https://github.com/BartolomeoRusso9/SpotiFLAC-Module-Version.git \
+            spotiflac-src
+
+      - name: Inspect project
+        working-directory: spotiflac-src
+        run: |
+          python --version
+          git log -1 --oneline
+          find . -maxdepth 2 -type f \
+            \( -name "pyproject.toml" \
+            -o -name "setup.py" \
+            -o -name "setup.cfg" \
+            -o -name "requirements*.txt" \
+            -o -name "README*" \) -print
+
+      - name: Install project
+        working-directory: spotiflac-src
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f pyproject.toml ] || [ -f setup.py ]; then
+            python -m pip install .
+          else
+            echo "No standard Python package installer metadata found."
+            exit 1
+          fi
+
+      - name: Check installed command
+        run: |
+          python -m pip check
+          python -m pip list
+          if command -v spotiflac >/dev/null 2>&1; then
+            spotiflac --help
+          else
+            echo "The spotiflac command was not installed."
+            exit 1
+          fi
+          
