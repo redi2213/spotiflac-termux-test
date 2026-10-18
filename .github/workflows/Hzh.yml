@@ -16,7 +16,10 @@ jobs:
   test:
     name: Test SpotiFLAC
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
+
+    env:
+      SPOTIFLAC_REGISTRY: https://raw.githubusercontent.com/spotiflacapp/SpotiFLAC-Extension/main/registry.json
 
     steps:
       - name: Checkout repository
@@ -27,6 +30,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install system dependencies
         id: system
         shell: bash
@@ -36,6 +44,8 @@ jobs:
           sudo apt-get install -y ffmpeg
           ffmpeg -version | head -n 1 | tee ffmpeg-version.txt
           echo "FFMPEG_VERSION=$(head -n 1 ffmpeg-version.txt)" >> "$GITHUB_OUTPUT"
+          node --version
+          npm --version
 
       - name: Install SpotiFLAC
         id: install
@@ -45,6 +55,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install SpotiFLAC
           python -m pip show SpotiFLAC | tee spotiflac-package.txt
+
           VERSION="$(python -m pip show SpotiFLAC | awk '/^Version:/ {print $2}')"
           echo "SPOTIFLAC_VERSION=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -53,7 +64,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          spotiflac --help 2>&1 | tee cli-help.txt
+          spotiflac --help > cli-help.txt 2>&1
+          cat cli-help.txt
           echo "CLI_EXIT_CODE=0" >> "$GITHUB_OUTPUT"
 
       - name: Validate Spotify URL
@@ -63,6 +75,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python - <<'PY' | tee url-validation.txt
           import os
           import re
@@ -76,9 +89,13 @@ jobs:
               parsed.path.rstrip("/")
           )
 
-          if parsed.scheme != "https" or parsed.netloc != "open.spotify.com" or not match:
+          if (
+              parsed.scheme != "https"
+              or parsed.netloc != "open.spotify.com"
+              or not match
+          ):
               print("URL_VALIDATION=FAILED")
-              print("Expected a Spotify track, album, or playlist URL.")
+              print("Unsupported Spotify URL.")
               sys.exit(1)
 
           print("URL_VALIDATION=PASSED")
@@ -87,10 +104,38 @@ jobs:
           print(f"SPOTIFY_URL={url}")
           PY
 
-      - name: Run SpotiFLAC diagnostic test
+      - name: Install Tidal extension
+        id: extension
+        env:
+          SPOTIFLAC_REGISTRY: ${{ env.SPOTIFLAC_REGISTRY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY' 2>&1 | tee extension-install.log
+          import os
+          from SpotiFLAC.extensions import ExtensionManager
+
+          registry = os.environ["SPOTIFLAC_REGISTRY"]
+          print(f"Registry: {registry}")
+          print("Installing extension: tidal-web")
+
+          manager = ExtensionManager()
+          result = manager.install(
+              "tidal-web",
+              registry_url=registry
+          )
+
+          print(f"EXTENSION_INSTALL_RESULT={result!r}")
+          print("EXTENSION_INSTALL_FINISHED")
+          PY
+
+      - name: Run SpotiFLAC download test
         id: test
+        if: steps.extension.outcome == 'success'
         env:
           SPOTIFY_URL: ${{ inputs.spotify_url }}
+          SPOTIFLAC_REGISTRY: ${{ env.SPOTIFLAC_REGISTRY }}
         shell: bash
         run: |
           mkdir -p test-output
@@ -101,28 +146,40 @@ jobs:
             --log-level DEBUG \
             --no-enrich \
             --no-lyrics \
+            --registries "$SPOTIFLAC_REGISTRY" \
             "$SPOTIFY_URL" \
-            ./test-output 2>&1 | tee spotiflac-debug.log
+            ./test-output \
+            --service ext:tidal-web \
+            2>&1 | sed -u -E \
+              's/(Access token acquired: )[A-Za-z0-9._-]+/\1[REDACTED]/g' \
+              | tee spotiflac-debug.log
 
           result=${PIPESTATUS[0]}
-          echo "SPOTIFLAC_EXIT_CODE=$result" | tee spotiflac-exit-code.txt
+          echo "$result" > spotiflac-exit-code.txt
           echo "SPOTIFLAC_EXIT_CODE=$result" >> "$GITHUB_OUTPUT"
 
+          echo "SpotiFLAC exit code: $result"
           exit 0
 
       - name: Collect diagnostic information
         if: always()
         env:
           SPOTIFY_URL: ${{ inputs.spotify_url }}
-          SPOTIFLAC_EXIT_CODE: ${{ steps.test.outputs.SPOTIFLAC_EXIT_CODE }}
           SPOTIFLAC_VERSION: ${{ steps.install.outputs.SPOTIFLAC_VERSION }}
           FFMPEG_VERSION: ${{ steps.system.outputs.FFMPEG_VERSION }}
           INSTALL_RESULT: ${{ steps.install.outcome }}
           CLI_RESULT: ${{ steps.cli.outcome }}
           VALIDATION_RESULT: ${{ steps.validate.outcome }}
+          EXTENSION_RESULT: ${{ steps.extension.outcome }}
           TEST_RESULT: ${{ steps.test.outcome }}
+          TEST_EXIT_CODE: ${{ steps.test.outputs.SPOTIFLAC_EXIT_CODE }}
         shell: bash
         run: |
+          mkdir -p test-output
+
+          FILE_COUNT="$(find test-output -type f 2>/dev/null | wc -l | tr -d ' ')"
+          FLAC_COUNT="$(find test-output -type f -iname '*.flac' 2>/dev/null | wc -l | tr -d ' ')"
+
           {
             echo "SPOTIFLAC_DIAGNOSTIC_REPORT"
             echo "=========================="
@@ -131,29 +188,37 @@ jobs:
             echo "Run ID: $GITHUB_RUN_ID"
             echo "Run URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "Python: $(python --version 2>&1)"
+            echo "Node.js: $(node --version 2>&1)"
             echo "SpotiFLAC version: ${SPOTIFLAC_VERSION:-unknown}"
             echo "FFmpeg: ${FFMPEG_VERSION:-unknown}"
             echo "Spotify URL: $SPOTIFY_URL"
             echo "Install step: ${INSTALL_RESULT:-unknown}"
             echo "CLI step: ${CLI_RESULT:-unknown}"
             echo "URL validation: ${VALIDATION_RESULT:-unknown}"
-            echo "Test step: ${TEST_RESULT:-unknown}"
-            echo "SpotiFLAC exit code: ${SPOTIFLAC_EXIT_CODE:-unknown}"
+            echo "Extension installation: ${EXTENSION_RESULT:-unknown}"
+            echo "Download test step: ${TEST_RESULT:-unknown}"
+            echo "SpotiFLAC exit code: ${TEST_EXIT_CODE:-unknown}"
+            echo "Output file count: $FILE_COUNT"
+            echo "FLAC file count: $FLAC_COUNT"
             echo
             echo "URL VALIDATION"
             echo "--------------"
-            cat url-validation.txt 2>/dev/null || echo "Validation output unavailable."
+            cat url-validation.txt 2>/dev/null || true
+            echo
+            echo "EXTENSION INSTALL LOG"
+            echo "--------------------"
+            cat extension-install.log 2>/dev/null || echo "No extension installation log."
             echo
             echo "OUTPUT FILES"
             echo "------------"
             find test-output -maxdepth 5 -type f -printf '%p (%s bytes)\n' 2>/dev/null || true
             echo
-            echo "DEBUG LOG: LAST 150 LINES"
-            echo "-------------------------"
+            echo "DOWNLOAD LOG: LAST 150 LINES"
+            echo "----------------------------"
             if [ -f spotiflac-debug.log ]; then
               tail -n 150 spotiflac-debug.log
             else
-              echo "Debug log was not created."
+              echo "Download log was not created."
             fi
           } > diagnostic-summary.txt
 
@@ -174,6 +239,7 @@ jobs:
           name: spotiflac-diagnostics-${{ github.run_id }}
           path: |
             diagnostic-summary.txt
+            extension-install.log
             spotiflac-debug.log
             spotiflac-exit-code.txt
             url-validation.txt
@@ -190,15 +256,26 @@ jobs:
           INSTALL_RESULT: ${{ steps.install.outcome }}
           CLI_RESULT: ${{ steps.cli.outcome }}
           VALIDATION_RESULT: ${{ steps.validate.outcome }}
+          EXTENSION_RESULT: ${{ steps.extension.outcome }}
+          TEST_RESULT: ${{ steps.test.outcome }}
           TEST_EXIT_CODE: ${{ steps.test.outputs.SPOTIFLAC_EXIT_CODE }}
         shell: bash
         run: |
+          FILE_COUNT="$(find test-output -type f 2>/dev/null | wc -l | tr -d ' ')"
+          FLAC_COUNT="$(find test-output -type f -iname '*.flac' 2>/dev/null | wc -l | tr -d ' ')"
+
           if [ "$INSTALL_RESULT" != "success" ] ||
              [ "$CLI_RESULT" != "success" ] ||
              [ "$VALIDATION_RESULT" != "success" ] ||
-             [ "$TEST_EXIT_CODE" != "0" ]; then
-            echo "Diagnostic test failed. See the summary and uploaded artifacts."
+             [ "$EXTENSION_RESULT" != "success" ] ||
+             [ "$TEST_RESULT" != "success" ] ||
+             [ "$TEST_EXIT_CODE" != "0" ] ||
+             [ "$FILE_COUNT" = "0" ]; then
+            echo "Diagnostic test failed or produced no output files."
+            echo "Check the diagnostic summary and uploaded artifacts."
             exit 1
           fi
 
-          echo "Diagnostic command completed successfully."
+          echo "Output files created: $FILE_COUNT"
+          echo "FLAC files created: $FLAC_COUNT"
+          echo "Diagnostic test completed."
